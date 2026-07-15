@@ -1,0 +1,51 @@
+msgid ""
+msgstr ""
+"MIME-Version: 1.0\n"
+"Content-Type: text/plain; charset=UTF-8\n"
+"Content-Transfer-Encoding: 8bit\n"
+"Language: ja-JP\n"
+
+msgid "SSAO"
+msgstr "SSAO"
+
+msgid "Strength"
+msgstr "強度"
+
+msgid "Radius"
+msgstr "半径"
+
+msgid "Power"
+msgstr "コントラスト"
+
+msgid "AO Color"
+msgstr "AOの色"
+
+msgid "Quality"
+msgstr "品質"
+
+msgid "Low"
+msgstr "低"
+
+msgid "Medium"
+msgstr "中"
+
+msgid "High"
+msgstr "高"
+
+msgid "Ultra"
+msgstr "最高"
+
+msgid "Denoise"
+msgstr "ノイズ低減"
+
+msgid "Bias"
+msgstr "バイアス"
+
+msgid "Fade Distance"
+msgstr "フェード距離"
+
+msgid "Max Radius (px)"
+msgstr "画面上の最大半径 (px)"
+
+msgid "Disable in Mirror"
+msgstr "ミラーで無効化"
