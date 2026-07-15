@@ -11,8 +11,8 @@ msgstr "SSAO"
 msgid "Strength"
 msgstr "強度"
 
-msgid "Radius"
-msgstr "半径"
+msgid "Sample Length"
+msgstr "サンプル距離"
 
 msgid "Power"
 msgstr "コントラスト"
@@ -35,17 +35,20 @@ msgstr "高"
 msgid "Ultra"
 msgstr "最高"
 
-msgid "Denoise"
-msgstr "ノイズ低減"
+msgid "Dither"
+msgstr "ディザ"
 
 msgid "Bias"
 msgstr "バイアス"
 
+msgid "Min Distance"
+msgstr "最小距離"
+
+msgid "Max Distance"
+msgstr "最大距離"
+
 msgid "Fade Distance"
 msgstr "フェード距離"
-
-msgid "Max Radius (px)"
-msgstr "画面上の最大半径 (px)"
 
 msgid "Disable in Mirror"
 msgstr "ミラーで無効化"

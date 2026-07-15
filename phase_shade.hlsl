@@ -7,102 +7,96 @@
 
     if (_Enable && depthUsable)
     {
-        // このピクセルのビュー空間深度。深度テクスチャの値(SCGetFrameDepth)と同じスケール
-        float depth = vertex.positionRaw.w;
+        // アングルベースSSAO (UE4 style)
+        // ref: custom_insert.hlsl (ShadowEx)
+        //
+        // アルゴリズム概要:
+        //   1. フラグメントのビュー空間位置を中心点とする
+        //   2. 6方向 × 対称2点 (A/B) = 12回の深度サンプリングを1セットとする
+        //   3. 各サンプル点のビュー空間位置を深度から復元
+        //   4. 「中心→サンプル点」の方向と「中心→カメラ」の方向の内積 (角度) を平均して遮蔽度とする
+        //      (遮蔽物が手前にあるほどサンプル方向がカメラ側へ傾き、内積が大きくなる)
 
-        // ビュー空間: x=右 / y=上 / z=カメラ方向(正=手前)
-        float3 positionVS = mul(SC_W2V(), float4(vertex.position, 1)).xyz;
-        half3 normalVS = normalize(mul((float3x3)SC_W2V(), sd.N));
+        float3 centerVS = mul(SC_W2V(), float4(vertex.position, 1.0)).xyz;
+        float centerEyeDepth = -centerVS.z;
+        float3 surfaceToCameraDir = -normalize(centerVS);
 
-        // ビュー空間のオフセット(m) → 深度テクスチャのUVオフセットへの変換係数
-        float2 projScale = abs(SC_V2P()._m00_m11) * 0.5;
+        // ピクセルごとにサンプリングパターンを回転してバンディングをノイズ化 (任意)
+        float ditherRad = _Dither > 0.5 ? com_dennokoworks_ssao_IGN(vertex.positionRaw.xy) * 6.2831853 : 0.0;
 
-        // 法線を軸にした半球サンプリング用の基底
-        half3 axis = abs(normalVS.z) < 0.9 ? half3(0,0,1) : half3(1,0,0);
-        half3 tangentVS = normalize(cross(axis, normalVS));
-        half3 binormalVS = cross(normalVS, tangentVS);
+        float minDist = max(_MinDistance, 0.0001);
+        float maxDist = max(_MaxDistance, 0.001);
+        float biasValue = _Bias;
+        uint iterations = (uint)clamp(_Quality + 0.5, 1.0, 4.0);
+        // パターンは約60°周期なので、反復ごとに 60°/K ずつ回転させて角度の隙間を埋める
+        float iterationStep = (3.14159265 / 3.0) / (float)iterations;
 
-        float2 pixel = vertex.positionRaw.xy;
-        float2 parity = fmod(floor(pixel), 2.0);
+        float occludedAcc = 0.0;
 
-        // デノイズ時は2x2クアッドの4ピクセルで同じ回転を共有し、各ピクセルには同一列の別スライスを
-        // 割り当てる。こうするとクアッド平均の結果が「4*sampleCount個の低ディスクレパンシ列による
-        // 推定量」に一致し、タップ数を増やさずに分散が下がる。
-        // デノイズ無効時はクアッド単位のノイズだと2x2のブロックが見えるのでピクセル単位に戻す
-        float2 noisePixel = _Denoise ? floor(pixel * 0.5) : pixel;
-        float noise = frac(52.9829189 * frac(dot(noisePixel, float2(0.06711056, 0.00583715))));
-        uint sliceIndex = _Denoise ? (uint)(parity.x + 2 * parity.y) : 0u;
-        uint sliceCount = _Denoise ? 4u : 1u;
-
-        float sampleRadius = max(_Radius, 1e-3);
-
-        // 近距離では半径が画面上で巨大になり、少ないタップでは完全な undersampling になる。
-        // 投影後の半径に上限を設けて、超える場合はワールド半径のほうを縮める
-        float radiusPixels = sampleRadius * projScale.x * _ScreenParams.x / depth;
-        float radiusLimit = max(_MaxRadiusPixels, 1);
-        sampleRadius *= min(1, radiusLimit / max(radiusPixels, 1e-4));
-
-        float depthBias = _Bias;
-
-        // バイアス境界での 0↔1 の飛びがサンプルごとの分散＝ノイズになるため、半径に比例した幅で滑らかに渡す
-        float falloffWidth = max(sampleRadius * 0.25, 1e-4);
-
-        // 品質: Low=4 / Medium=8 / High=16 / VeryHigh=32 サンプル
-        uint sampleCount = 4u << _Quality;
-        float sampleCountInv = 1.0 / sampleCount;
-
-        float occlusion = 0;
-        for (uint index = 0; index < sampleCount; index++)
+        for (uint k = 0; k < iterations; k++)
         {
-            // 方位角・仰角・距離を3次元の低ディスクレパンシ列(R3)から独立に取る。
-            // 同じ乱数を方向と距離に使い回すと半球が法線方向に潰れた形になる
-            float3 r3 = float3(0.8191725134, 0.6710436067, 0.5497004779);
-            float3 xi = frac(r3 * (index * sliceCount + sliceIndex) + noise);
+            float baseRad = ditherRad + iterationStep * (float)k;
 
-            // コサイン重み付き半球方向
-            float angle = xi.x * 6.2831853;
-            float diskRadius = sqrt(xi.y);
-            float3 dirTS = float3(cos(angle) * diskRadius, sin(angle) * diskRadius, sqrt(saturate(1 - xi.y)));
-            float3 dirVS = tangentVS * dirTS.x + binormalVS * dirTS.y + normalVS * dirTS.z;
+            for (uint i = 0; i < 6; i++)
+            {
+                float rad = SC_SSAO_ROTATIONS[i] + baseRad;
+                // 反復ごとに距離の割り当てもローテーションし、半径方向の隙間も埋める
+                float offsetLen = SC_SSAO_DISTANCES[(i + k) % 6] * _SampleLength;
+                float2 dir;
+                sincos(rad, dir.y, dir.x);
 
-            // 距離は方向と独立に決める。近距離を密にして接触部のAOを拾う
-            float dist = sampleRadius * lerp(0.25, 1.0, sqrt(xi.z));
-            float3 offsetVS = dirVS * dist;
+                // ビュー空間XY平面上の対称2点
+                float3 offsetA = float3(dir * offsetLen, 0.0);
 
-            // サンプル点を透視投影してUVを求める。第2項は画面中心から外れた位置での視差
-            // (サンプル点の深度が変わることで生じる横ずれ)の補正
-            float sampleDepth = max(depth - offsetVS.z, 0.01);
-            float2 parallax = positionVS.xy * (offsetVS.z / depth);
-            float2 sampUV = vertex.uvDepth + (offsetVS.xy + parallax) * projScale / sampleDepth;
+                // --- サンプルA ---
+                float3 samplePosA = centerVS + offsetA;
+                float eyeDepthA;
+                if (com_dennokoworks_ssao_SampleEyeDepth(samplePosA, eyeDepthA))
+                {
+                    if (abs(centerEyeDepth - eyeDepthA) >= biasValue)
+                    {
+                        float3 reconstructedA = com_dennokoworks_ssao_ReconstructVS(samplePosA, eyeDepthA);
+                        float distA = distance(reconstructedA, centerVS);
+                        if (distA >= minDist && distA <= maxDist)
+                        {
+                            float dA = dot((reconstructedA - centerVS) / distA, surfaceToCameraDir);
+                            float falloffA = 1.0 - saturate(distA / maxDist);
+                            occludedAcc += max(0.0, dA) * falloffA;
+                        }
+                    }
+                }
 
-            // 深度テクスチャ上の実際の面がサンプル点より手前なら遮蔽
-            float sceneDepth = SCGetFrameDepth(sampUV);
-            float diff = sampleDepth - sceneDepth;
-            float occ = saturate((diff - depthBias) / falloffWidth);
-
-            // 注目ピクセルから半径以上離れた面は別の物体とみなして寄与を落とす
-            float range = saturate(sampleRadius / max(abs(depth - sceneDepth), 1e-4));
-            range = range * range * (3 - 2 * range);
-
-            occlusion += occ * range;
+                // --- サンプルB (対称点) ---
+                float3 samplePosB = centerVS - offsetA;
+                float eyeDepthB;
+                if (com_dennokoworks_ssao_SampleEyeDepth(samplePosB, eyeDepthB))
+                {
+                    if (abs(centerEyeDepth - eyeDepthB) >= biasValue)
+                    {
+                        float3 reconstructedB = com_dennokoworks_ssao_ReconstructVS(samplePosB, eyeDepthB);
+                        float distB = distance(reconstructedB, centerVS);
+                        if (distB >= minDist && distB <= maxDist)
+                        {
+                            float dB = dot((reconstructedB - centerVS) / distB, surfaceToCameraDir);
+                            float falloffB = 1.0 - saturate(distB / maxDist);
+                            occludedAcc += max(0.0, dB) * falloffB;
+                        }
+                    }
+                }
+            }
         }
 
-        float ao = 1 - occlusion * sampleCountInv;
+        // (6方向 × 対称2点 × 反復数) の平均
+        float aoRate = occludedAcc / (12.0 * (float)iterations);
 
-        // 2x2クアッド内で平均し、少ないサンプル数でのノイズを均す
-        float aoQuad = ao + ddx(ao) * (0.5 - parity.x) + ddy(ao) * (0.5 - parity.y);
-        ao = _Denoise ? aoQuad : ao;
-
-        ao = pow(saturate(ao), _Power);
+        float ao = saturate(pow(saturate(aoRate), _Power) * _Strength);
 
         // 遠景ではサンプル間隔に対して深度差が粗くなるためフェードアウトさせる
         float fadeLength = max(_FadeDistance * 0.25, 1e-3);
-        float fade = saturate((_FadeDistance - depth) / fadeLength);
+        float fade = saturate((_FadeDistance - centerEyeDepth) / fadeLength);
 
-        half strength = _Strength * fade * sd.mask[_MaskChannel];
-        ao = saturate(lerp(1, ao, strength));
-
-        half3 aoColor = lerp(_AOColor.rgb, half3(1,1,1), ao);
+        half strength = ao * fade * sd.mask[_MaskChannel];
+        half3 aoColor = lerp(half3(1,1,1), _AOColor.rgb, strength);
         sd.lightColor *= aoColor;
     }
 }
