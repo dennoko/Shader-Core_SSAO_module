@@ -6,6 +6,7 @@ SC_color(_AOColor, (0,0,0,1), [], "AO Color", "")
 SC_Box
 SC_uint(_Quality, 2, [SCEnum(Low,1,Medium,2,High,3,Ultra,4)][SCConstValue(4,pixel)], "Quality", "")
 SC_uint(_Dither, 1, [SCToggle][SCConstValue(1,pixel)], "Dither", "")
+SC_uint(_ReduceSelfOcclusion, 0, [SCToggle][SCConstValue(1,pixel)], "Reduce Self Occlusion", "")
 SC_float(_Bias, 0.02, [SCRange(0,0.2)], "Bias", "")
 SC_float(_MinDistance, 0.001, [SCRange(0,0.1)], "Min Distance", "")
 SC_float(_MaxDistance, 0.5, [SCRange(0.01,2)], "Max Distance", "")

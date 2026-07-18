@@ -19,84 +19,77 @@
 
         float3 centerVS = mul(SC_W2V(), float4(vertex.position, 1.0)).xyz;
         float centerEyeDepth = -centerVS.z;
-        float3 surfaceToCameraDir = -normalize(centerVS);
 
-        // ピクセルごとにサンプリングパターンを回転してバンディングをノイズ化 (任意)
-        float ditherRad = _Dither > 0.5 ? com_dennokoworks_ssao_IGN(vertex.positionRaw.xy) * 6.2831853 : 0.0;
-
-        float minDist = max(_MinDistance, 0.0001);
-        float maxDist = max(_MaxDistance, 0.001);
-        float biasValue = _Bias;
-        uint iterations = (uint)clamp(_Quality + 0.5, 1.0, 4.0);
-        // パターンは約60°周期なので、反復ごとに 60°/K ずつ回転させて角度の隙間を埋める
-        float iterationStep = (3.14159265 / 3.0) / (float)iterations;
-
-        float occludedAcc = 0.0;
-
-        for (uint k = 0; k < iterations; k++)
-        {
-            float baseRad = ditherRad + iterationStep * (float)k;
-
-            for (uint i = 0; i < 6; i++)
-            {
-                float rad = SC_SSAO_ROTATIONS[i] + baseRad;
-                // 反復ごとに距離の割り当てもローテーションし、半径方向の隙間も埋める
-                float offsetLen = SC_SSAO_DISTANCES[(i + k) % 6] * _SampleLength;
-                float2 dir;
-                sincos(rad, dir.y, dir.x);
-
-                // ビュー空間XY平面上の対称2点
-                float3 offsetA = float3(dir * offsetLen, 0.0);
-
-                // --- サンプルA ---
-                float3 samplePosA = centerVS + offsetA;
-                float eyeDepthA;
-                if (com_dennokoworks_ssao_SampleEyeDepth(samplePosA, eyeDepthA))
-                {
-                    if (abs(centerEyeDepth - eyeDepthA) >= biasValue)
-                    {
-                        float3 reconstructedA = com_dennokoworks_ssao_ReconstructVS(samplePosA, eyeDepthA);
-                        float distA = distance(reconstructedA, centerVS);
-                        if (distA >= minDist && distA <= maxDist)
-                        {
-                            float dA = dot((reconstructedA - centerVS) / distA, surfaceToCameraDir);
-                            float falloffA = 1.0 - saturate(distA / maxDist);
-                            occludedAcc += max(0.0, dA) * falloffA;
-                        }
-                    }
-                }
-
-                // --- サンプルB (対称点) ---
-                float3 samplePosB = centerVS - offsetA;
-                float eyeDepthB;
-                if (com_dennokoworks_ssao_SampleEyeDepth(samplePosB, eyeDepthB))
-                {
-                    if (abs(centerEyeDepth - eyeDepthB) >= biasValue)
-                    {
-                        float3 reconstructedB = com_dennokoworks_ssao_ReconstructVS(samplePosB, eyeDepthB);
-                        float distB = distance(reconstructedB, centerVS);
-                        if (distB >= minDist && distB <= maxDist)
-                        {
-                            float dB = dot((reconstructedB - centerVS) / distB, surfaceToCameraDir);
-                            float falloffB = 1.0 - saturate(distB / maxDist);
-                            occludedAcc += max(0.0, dB) * falloffB;
-                        }
-                    }
-                }
-            }
-        }
-
-        // (6方向 × 対称2点 × 反復数) の平均
-        float aoRate = occludedAcc / (12.0 * (float)iterations);
-
-        float ao = saturate(pow(saturate(aoRate), _Power) * _Strength);
-
-        // 遠景ではサンプル間隔に対して深度差が粗くなるためフェードアウトさせる
+        // 遠景ではサンプル間隔に対して深度差が粗くなるためフェードアウトさせる。
+        // フェードとマスクはループ前に確定するので、結果が0ならサンプリングごとスキップする
         float fadeLength = max(_FadeDistance * 0.25, 1e-3);
         float fade = saturate((_FadeDistance - centerEyeDepth) / fadeLength);
+        half maskVal = sd.mask[_MaskChannel];
 
-        half strength = ao * fade * sd.mask[_MaskChannel];
-        half3 aoColor = lerp(half3(1,1,1), _AOColor.rgb, strength);
-        sd.lightColor *= aoColor;
+        if (fade * maskVal > 0.001)
+        {
+            float3 surfaceToCameraDir = -normalize(centerVS);
+
+            // ピクセルごとにサンプリングパターンを回転してバンディングをノイズ化 (任意)
+            float ditherRad = _Dither > 0.5 ? com_dennokoworks_ssao_IGN(vertex.positionRaw.xy) * 6.2831853 : 0.0;
+
+            float minDist = max(_MinDistance, 0.0001);
+            float maxDist = max(_MaxDistance, 0.001);
+            float minDistSq = minDist * minDist;
+            float maxDistSq = maxDist * maxDist;
+            float rcpMaxDist = 1.0 / maxDist;
+            float biasValue = _Bias;
+            uint iterations = (uint)clamp(_Quality + 0.5, 1.0, 4.0);
+            // パターンは約60°周期なので、反復ごとに 60°/K ずつ回転させて角度の隙間を埋める
+            float iterationStep = (3.14159265 / 3.0) / (float)iterations;
+
+            // サンプルオフセットは z=0 平面内なのでクリップ空間の w (= centerEyeDepth) は
+            // 中心と共通。射影は中心で1回だけ行い、サンプルごとのUVは2Dのスケール加算に縮約する。
+            // VRの非対称視錐台 (_m02/_m12) は z に掛かる項なので offset.z=0 により影響しない。
+            // Y反転は ComputeScreenPos と同じく _ProjectionParams.x の符号に従う
+            float4x4 v2p = SC_V2P();
+            float4 centerCS = mul(v2p, float4(centerVS, 1.0));
+            float rcpW = 0.5 / centerCS.w;  // 描画中のフラグメントなので w > 0 が保証される
+            float2 uvScale = float2(v2p._m00, v2p._m11 * _ProjectionParams.x) * rcpW;
+            float2 centerUV = float2(centerCS.x, centerCS.y * _ProjectionParams.x) * rcpW + 0.5;
+
+            float occludedAcc = 0.0;
+
+            for (uint k = 0; k < iterations; k++)
+            {
+                float baseRad = ditherRad + iterationStep * (float)k;
+
+                for (uint i = 0; i < 6; i++)
+                {
+                    float rad = SC_SSAO_ROTATIONS[i] + baseRad;
+                    // 反復ごとに距離の割り当てもローテーションし、半径方向の隙間も埋める
+                    float offsetLen = SC_SSAO_DISTANCES[(i + k) % 6] * _SampleLength;
+                    float2 dir;
+                    sincos(rad, dir.y, dir.x);
+
+                    // ビュー空間XY平面上の対称2点。UVデルタは符号反転で共有できる
+                    float3 offsetA = float3(dir * offsetLen, 0.0);
+                    float2 uvDelta = uvScale * offsetA.xy;
+
+                    float cA = com_dennokoworks_ssao_SampleOcclusion(centerUV + uvDelta, centerVS + offsetA,
+                        centerVS, centerEyeDepth, surfaceToCameraDir, biasValue, minDistSq, maxDistSq, rcpMaxDist);
+                    float cB = com_dennokoworks_ssao_SampleOcclusion(centerUV - uvDelta, centerVS - offsetA,
+                        centerVS, centerEyeDepth, surfaceToCameraDir, biasValue, minDistSq, maxDistSq, rcpMaxDist);
+
+                    // 対称ペアの合成: 通常は各サンプル独立。Reduce Self Occlusion 有効時はペア和で
+                    // 同一平面成分 (cA ≈ -cB) を相殺し、グレージング角での偽遮蔽を抑える
+                    occludedAcc += _ReduceSelfOcclusion ? max(0.0, cA + cB) : max(0.0, cA) + max(0.0, cB);
+                }
+            }
+
+            // (6方向 × 対称2点 × 反復数) の平均
+            float aoRate = occludedAcc / (12.0 * (float)iterations);
+
+            float ao = saturate(pow(saturate(aoRate), _Power) * _Strength);
+
+            half strength = ao * fade * maskVal;
+            half3 aoColor = lerp(half3(1,1,1), _AOColor.rgb, strength);
+            sd.lightColor *= aoColor;
+        }
     }
 }
